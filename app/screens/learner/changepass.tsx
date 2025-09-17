@@ -5,6 +5,7 @@ import { router } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
   Animated,
   Dimensions,
   Image,
@@ -18,6 +19,10 @@ import {
   heightPercentageToDP as hp,
   widthPercentageToDP as wp,
 } from "react-native-responsive-screen";
+
+// ✅ Use React Native Firebase instead of web SDK
+import auth from "@react-native-firebase/auth";
+import firestore from '@react-native-firebase/firestore';
 
 export default function HomeScreen() {
   const [fontsLoaded] = useFonts({
@@ -34,6 +39,10 @@ export default function HomeScreen() {
     confirmPassword: "",
   });
 
+  // Profile image state
+  const [profileImageUrl, setProfileImageUrl] = useState<string | null>(null);
+  const [loadingImage, setLoadingImage] = useState(true);
+
   // Notification state
   const [notification, setNotification] = useState({
     message: "",
@@ -44,6 +53,36 @@ export default function HomeScreen() {
 
   const { width } = Dimensions.get("window");
   const isTablet = width > 968;
+
+  // Fetch profile image from Firebase
+  useEffect(() => {
+    const fetchProfileImage = async () => {
+      if (!user?.uid) {
+        setLoadingImage(false);
+        return;
+      }
+
+      try {
+        setLoadingImage(true);
+        const userDoc = await firestore()
+          .collection('users')
+          .doc(user.uid)
+          .get();
+
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          const profilePicUrl = userData?.profile_pic || userData?.profilePic || userData?.profile_picture;
+          setProfileImageUrl(profilePicUrl || null);
+        }
+      } catch (error) {
+        console.error("Error fetching profile image:", error);
+      } finally {
+        setLoadingImage(false);
+      }
+    };
+
+    fetchProfileImage();
+  }, [user]);
 
   useEffect(() => {
     const lockOrientation = async () => {
@@ -88,54 +127,71 @@ export default function HomeScreen() {
     }, 3000);
   };
 
-  const handleSave = () => {
-    const { oldPassword, newPassword, confirmPassword } = passwords;
+  
+const handleSave = async () => {
+  const { oldPassword, newPassword, confirmPassword } = passwords;
 
-    // First check if all fields are filled
-    if (!oldPassword || !newPassword || !confirmPassword) {
-      showPopup("Please fill in all fields", "error");
+  if (!oldPassword || !newPassword || !confirmPassword) {
+    showPopup("Please fill in all fields", "error");
+    return;
+  }
+
+  if (newPassword !== confirmPassword) {
+    showPopup("New passwords do not match", "error");
+    return;
+  }
+
+  if (newPassword === oldPassword) {
+    showPopup("New password cannot be the same as old password", "error");
+    return;
+  }
+
+  if (newPassword.length < 6) {
+    showPopup("Password must be at least 6 characters long", "error");
+    return;
+  }
+
+  try {
+    // ✅ Get current user from React Native Firebase
+    const currentUser = auth().currentUser;
+
+    if (!currentUser || !currentUser.email) {
+      showPopup("No user is logged in", "error");
       return;
     }
 
-    // Get current password from auth store (fallback to default if not set)
-    const currentPassword = user?.password || "123456";
+    // ✅ Create credential for re-authentication
+    const credential = auth.EmailAuthProvider.credential(
+      currentUser.email,
+      oldPassword
+    );
 
-    // Check if old password is correct
-    if (oldPassword !== currentPassword) {
-      showPopup("Incorrect old password", "error");
-      return;
-    }
+    // ✅ Re-authenticate with old password
+    await currentUser.reauthenticateWithCredential(credential);
 
-    // Check if new passwords match
-    if (newPassword !== confirmPassword) {
-      showPopup("New passwords do not match", "error");
-      return;
-    }
+    // ✅ Update password in Firebase Auth
+    await currentUser.updatePassword(newPassword);
 
-    // Check if new password is different from old password
-    if (newPassword === oldPassword) {
-      showPopup("New password cannot be same as old password", "error");
-      return;
-    }
-
-    // Validate password strength (optional)
-    if (newPassword.length < 6) {
-      showPopup("Password must be at least 6 characters long", "error");
-      return;
-    }
-
-    // Update password in auth store
+    // ✅ Update in Zustand store (optional)
     updatePassword(newPassword);
 
-    // ✅ Success
     showPopup("Password changed successfully!", "success");
     setIsEditing(false);
-    setPasswords({
-      oldPassword: "",
-      newPassword: "",
-      confirmPassword: "",
-    });
-  };
+    setPasswords({ oldPassword: "", newPassword: "", confirmPassword: "" });
+  } catch (error: any) {
+    
+    // ✅ Handle React Native Firebase error codes
+    if (error.code === "auth/wrong-password" || error.code === "auth/invalid-credential") {
+      showPopup("Incorrect old password", "error");
+    } else if (error.code === "auth/weak-password") {
+      showPopup("Password is too weak", "error");
+    } else if (error.code === "auth/requires-recent-login") {
+      showPopup("Please log out and log back in, then try again", "error");
+    } else {
+      showPopup(error.message || "Failed to update password", "error");
+    }
+  }
+};
 
   if (!fontsLoaded) {
     return null;
@@ -182,10 +238,24 @@ export default function HomeScreen() {
         <View style={[styles.body, isTablet ? styles.body : styles.bodyMobile]}>
           <View style={styles.layer1}>
             <View style={styles.ProfileContainer}>
-              <Image
-                source={require("@/assets/images/stock.jpg")}
-                style={styles.ProfileImage}
-              />
+              {loadingImage ? (
+                <View style={styles.ProfileImageLoading}>
+                  <ActivityIndicator size="small" color="#9B72CF" />
+                </View>
+              ) : (
+                <Image
+                  source={
+                    profileImageUrl 
+                      ? { uri: profileImageUrl }
+                      : require("@/assets/images/defaultimg.jpg")
+                  }
+                  style={styles.ProfileImage}
+                  onError={(error) => {
+                    console.log("Error loading profile image:", error);
+                    setProfileImageUrl(null); 
+                  }}
+                />
+              )}
             </View>
           </View>
 
@@ -367,6 +437,15 @@ const styles = StyleSheet.create({
     borderRadius: wp(9),
     resizeMode: "cover",
     marginRight: wp(1),
+  },
+  ProfileImageLoading: {
+    width: wp(15),
+    height: wp(15),
+    borderRadius: wp(9),
+    backgroundColor: "#f0f0f0",
+    marginRight: wp(1),
+    justifyContent: "center",
+    alignItems: "center",
   },
   // LAYER 2
   layer2: {

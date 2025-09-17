@@ -1,20 +1,21 @@
-
 import { ThemedView } from "@/components/ThemedView";
 import { useAuthStore } from "@/stores/userAuthStore";
 import { useFonts } from "expo-font";
 import { router } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
-import { doc, getDoc, getFirestore, updateDoc } from "firebase/firestore";
+import * as ImagePicker from "expo-image-picker";
+import * as FileSystem from "expo-file-system";
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Animated,
   Dimensions,
   Image,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
-  Animated,
+  Alert,
 } from "react-native";
 import { GestureHandlerRootView, TextInput } from "react-native-gesture-handler";
 import {
@@ -22,7 +23,20 @@ import {
   widthPercentageToDP as wp,
 } from "react-native-responsive-screen";
 
-const db = getFirestore();
+// React Native Firebase SDK imports
+import firestore from '@react-native-firebase/firestore';
+
+interface ProfileFormData {
+  fname: string;
+  mname: string;
+  lname: string;
+  dob: string;
+  gender: string;
+  pname: string;
+  phoneNumber: string;
+  studId: string;
+  email: string;
+}
 
 export default function ProfileScreen() {
   const [fontsLoaded] = useFonts({
@@ -31,12 +45,13 @@ export default function ProfileScreen() {
 
   const { width } = Dimensions.get("window");
   const isTablet = width > 968;
-
   const user = useAuthStore((state) => state.user);
-
-  const [isEditing, setIsEditing] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [formData, setFormData] = useState({
+  const [isEditing, setIsEditing] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [profileImageUrl, setProfileImageUrl] = useState<string | null>(null);
+  
+  // Initialize with proper typing
+  const initialFormData: ProfileFormData = {
     fname: "",
     mname: "",
     lname: "",
@@ -46,28 +61,24 @@ export default function ProfileScreen() {
     phoneNumber: "",
     studId: "",
     email: "",
-  });
-  const [originalData, setOriginalData] = useState(formData);
+  };
+
+  
+  const [formData, setFormData] = useState<ProfileFormData>(initialFormData);
+  const [originalData, setOriginalData] = useState<ProfileFormData>(initialFormData);
 
   // Notification states
-  const [notification, setNotification] = useState({
+  const [notification, setNotification] = useState<{
+    visible: boolean;
+    message: string;
+    type: "error" | "success";
+  }>({
     visible: false,
     message: "",
-    type: "error" // "error" or "success"
+    type: "error"
   });
+  
   const [slideAnim] = useState(new Animated.Value(-100));
-
-  interface ProfileFormData {
-    fname: string;
-    mname: string;
-    lname: string;
-    dob: string;
-    gender: string;
-    pname: string;
-    phoneNumber: string;
-    studId: string;
-    email: string;
-  }
 
   // Show notification function
   const showNotification = (message: string, type: "error" | "success" = "error") => {
@@ -80,7 +91,7 @@ export default function ProfileScreen() {
       useNativeDriver: true,
     }).start();
 
-    // Hide after 2 seconds
+    // Hide after 3 seconds for better readability
     setTimeout(() => {
       Animated.timing(slideAnim, {
         toValue: -100,
@@ -89,7 +100,64 @@ export default function ProfileScreen() {
       }).start(() => {
         setNotification({ visible: false, message: "", type: "error" });
       });
-    }, 2000);
+    }, 3000);
+  };
+
+  // -----------------------------
+  // IMAGE PICKER + BASE64 CONVERTER
+  // -----------------------------
+  const imageToBase64 = async (imageUri: string) => {
+    try {
+      let base64Image = await FileSystem.readAsStringAsync(imageUri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      return `data:image/jpeg;base64,${base64Image}`;
+    } catch (err) {
+      console.error("Error converting image to base64:", err);
+      return "";
+    }
+  };
+
+  const pickImage = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+    if (status !== "granted") {
+      Alert.alert(
+        "Permission Denied",
+        "Sorry, camera roll permission is needed to upload."
+      );
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.7,
+    });
+
+    if (!result.canceled) {
+      const uri = result.assets[0].uri;
+
+      try {
+        const base64Img = await imageToBase64(uri);
+
+        if (!base64Img) {
+          Alert.alert("Upload Failed", "Could not convert image.");
+          return;
+        }
+
+        // Save to Firestore
+        await firestore()
+          .collection("users")
+          .doc(user?.uid)
+          .update({ profile_pic: base64Img });
+
+        setProfileImageUrl(base64Img);
+        showNotification("Profile picture updated successfully!", "success");
+      } catch (err) {
+        console.error("Upload failed:", err);
+        showNotification("Upload failed. Something went wrong.", "error");
+      }
+    }
   };
 
   // Fetch user data from Firebase
@@ -102,47 +170,71 @@ export default function ProfileScreen() {
 
       try {
         setLoading(true);
-        const userDoc = await getDoc(doc(db, "users", user.uid));
+        const userDoc = await firestore()
+          .collection('users')
+          .doc(user.uid)
+          .get();
 
-        if (userDoc.exists()) {
+        if (userDoc.exists) {
           const userData = userDoc.data();
 
           let guardianPhone = "";
           let guardianName = "";
 
-          // If child has guardianId, fetch guardian doc
-          if (userData.guardianId) {
-            const guardianDoc = await getDoc(doc(db, "users", userData.guardianId));
-            if (guardianDoc.exists()) {
-              const guardianData = guardianDoc.data();
-              guardianPhone = guardianData.phoneNumber || "";
-              guardianName = guardianData.fname && guardianData.lname
-                ? `${guardianData.fname} ${guardianData.lname}`
-                : guardianData.fname || guardianData.lname || "";
+          // If child has guardian_id, fetch guardian doc
+          if (userData?.guardian_id) {
+            try {
+              const guardianDoc = await firestore()
+                .collection('users')
+                .doc(userData.guardian_id)
+                .get();
+                
+              if (guardianDoc.exists) {
+                const guardianData = guardianDoc.data();
+                
+                // Fix: Use the correct field names from Firebase
+                guardianPhone = guardianData?.phone_number || guardianData?.phoneNumber || "";
+                
+                // Fix: Check for both possible field name formats
+                const guardianFirstName = guardianData?.first_name || guardianData?.fname || "";
+                const guardianLastName = guardianData?.last_name || guardianData?.lname || "";
+                
+                guardianName = guardianFirstName && guardianLastName
+                  ? `${guardianFirstName} ${guardianLastName}`
+                  : guardianFirstName || guardianLastName || "";
+              }
+            } catch (guardianError) {
+              console.error("Error fetching guardian data:", guardianError);
             }
           }
 
-          const profileData = {
-            fname: userData.first_name || userData.fname || "",
-            mname: userData.middle_name || userData.mname || "",
-            lname: userData.last_name || userData.lname || "",
-            dob: userData.dateOfBirth || userData.dob || "",
-            gender: userData.gender || "",
-            pname: guardianName,            // 👈 Guardian name
-            phoneNumber: guardianPhone,     // 👈 Guardian phone
-            studId: userData.guardianId || userData.studId || "",
-            email: userData.email || "",
+          const profileData: ProfileFormData = {
+            fname: userData?.first_name || userData?.fname || "",
+            mname: userData?.middle_name || userData?.mname || "",
+            lname: userData?.last_name || userData?.lname || "",
+            dob: userData?.dateOfBirth || userData?.dob || "",
+            gender: userData?.gender || "",
+            pname: guardianName,            // Guardian name
+            phoneNumber: guardianPhone,     // Guardian phone
+            studId: userData?.guardian_id || userData?.studId || "",
+            email: userData?.email || "",
           };
+
+          // Set profile image URL from Firebase
+          const profilePicUrl = userData?.profile_pic || userData?.profilePic || userData?.profile_picture;
+          setProfileImageUrl(profilePicUrl || null);
 
           setFormData(profileData);
           setOriginalData(profileData);
           console.log("Fetched user + guardian data:", profileData);
+          console.log("Profile image URL:", profilePicUrl);
         } else {
           console.log("No user document found");
+          showNotification("User profile not found", "error");
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error("Error fetching user data:", error);
-        showNotification("Error loading user data: " + error.message, "error");
+        showNotification("Error loading user data: " + (error?.message || "Unknown error"), "error");
       } finally {
         setLoading(false);
       }
@@ -181,22 +273,24 @@ export default function ProfileScreen() {
         dateOfBirth: formData.dob,
         gender: formData.gender,
         phoneNumber: formData.phoneNumber,
-        // Note: We're not updating email here as it requires special handling in Firebase Auth
       };
 
       // Update the user document in Firestore
-      await updateDoc(doc(db, "users", user.uid), updateData);
+      await firestore()
+        .collection('users')
+        .doc(user.uid)
+        .update(updateData);
 
       // Update original data to reflect the saved changes
-      setOriginalData(formData);
+      setOriginalData({ ...formData });
       setIsEditing(false);
 
       console.log("User data updated successfully");
       showNotification("Profile updated successfully!", "success");
 
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating user data:", error);
-      showNotification("Error updating profile: " + error.message, "error");
+      showNotification("Error updating profile: " + (error?.message || "Unknown error"), "error");
     } finally {
       setLoading(false);
     }
@@ -208,9 +302,13 @@ export default function ProfileScreen() {
 
   useEffect(() => {
     const lockOrientation = async () => {
-      await ScreenOrientation.lockAsync(
-        ScreenOrientation.OrientationLock.LANDSCAPE
-      );
+      try {
+        await ScreenOrientation.lockAsync(
+          ScreenOrientation.OrientationLock.LANDSCAPE
+        );
+      } catch (error) {
+        console.error("Error locking orientation:", error);
+      }
     };
     lockOrientation();
   }, []);
@@ -262,10 +360,23 @@ export default function ProfileScreen() {
         <View style={styles.body}>
           <View style={styles.layer1}>
             <View style={styles.ProfileContainer}>
-              <Image
-                source={require("@/assets/images/stock.jpg")}
-                style={styles.ProfileImage}
-              />
+              <TouchableOpacity onPress={pickImage}>
+                <View style={styles.ProfileImageContainer}>
+                  <Image
+                    source={
+                      profileImageUrl 
+                        ? { uri: profileImageUrl }
+                        : require("@/assets/images/defaultimg.jpg")
+                    }
+                    style={styles.ProfileImage}
+                    onError={(error) => {
+                      console.log("Error loading profile image:", error);
+                      setProfileImageUrl(null); 
+                    }}
+                  />
+                 
+                </View>
+              </TouchableOpacity>
 
               <View style={styles.ProfileTextContainer}>
                 {/* Email */}
@@ -280,11 +391,8 @@ export default function ProfileScreen() {
               </View>
             </View>
 
-            <TouchableOpacity
-              style={styles.ChangeProfileBtn}
-              onPress={() => router.push("../screens/learner/changepass")}
-            >
-              <Text style={styles.BtnText}>Upload New Photo</Text>
+            <TouchableOpacity style={[styles.ChangeProfileBtn]} onPress={pickImage}>
+                <Text style={styles.BtnText}>Upload New Photo</Text>
             </TouchableOpacity>
           </View>
 
@@ -294,12 +402,12 @@ export default function ProfileScreen() {
             <View style={styles.ParentInformationContainer}>
               <View style={styles.ParentInformation}>
                 <Text style={styles.InputTitle}>Name</Text>
-                <Text style={styles.InputData}>{formData?.pname || "N/A"}</Text>
+                <Text style={styles.InputData}>{formData.pname || "N/A"}</Text>
               </View>
 
               <View style={styles.ParentInformation}>
                 <Text style={styles.InputTitle}>Contact Number</Text>
-                <Text style={styles.InputData}>{formData?.phoneNumber || "N/A"}</Text>
+                <Text style={styles.InputData}>{formData.phoneNumber || "N/A"}</Text>
               </View>
             </View>
           </View>
@@ -324,7 +432,7 @@ export default function ProfileScreen() {
                     onChangeText={(text) => updateFormData("fname", text)}
                   />
                 ) : (
-                  <Text style={styles.InputData}>{formData?.fname || "N/A"}</Text>
+                  <Text style={styles.InputData}>{formData.fname || "N/A"}</Text>
                 )}
               </View>
 
@@ -344,7 +452,7 @@ export default function ProfileScreen() {
                     onChangeText={(text) => updateFormData("mname", text)}
                   />
                 ) : (
-                  <Text style={styles.InputData}>{formData?.mname || "N/A"}</Text>
+                  <Text style={styles.InputData}>{formData.mname || "N/A"}</Text>
                 )}
               </View>
 
@@ -364,7 +472,7 @@ export default function ProfileScreen() {
                     onChangeText={(text) => updateFormData("lname", text)}
                   />
                 ) : (
-                  <Text style={styles.InputData}>{formData?.lname || "N/A"}</Text>
+                  <Text style={styles.InputData}>{formData.lname || "N/A"}</Text>
                 )}
               </View>
 
@@ -385,7 +493,7 @@ export default function ProfileScreen() {
                     placeholder="MM - DD - YYYY"
                   />
                 ) : (
-                  <Text style={styles.InputData}>{formData?.dob || "N/A"}</Text>
+                  <Text style={styles.InputData}>{formData.dob || "N/A"}</Text>
                 )}
               </View>
 
@@ -405,7 +513,7 @@ export default function ProfileScreen() {
                     onChangeText={(text) => updateFormData("gender", text)}
                   />
                 ) : (
-                  <Text style={styles.InputData}>{formData?.gender || "N/A"}</Text>
+                  <Text style={styles.InputData}>{formData.gender || "N/A"}</Text>
                 )}
               </View>
             </View>
@@ -432,7 +540,7 @@ export default function ProfileScreen() {
           <View style={styles.categoryContainer}>
             <TouchableOpacity
               style={styles.categoryInfosActive}
-              onPress={() => router.push("../screens/learner/profile")}
+              onPress={() => router.push("/screens/learner/profile")}
             >
               <Image
                 source={require("@/assets/images/user2.png")}
@@ -463,13 +571,14 @@ export default function ProfileScreen() {
                 Change Password
               </Text>
             </TouchableOpacity>
-          </View>
+            </View>
         </View>
       </ThemedView>
     </GestureHandlerRootView>
   );
 }
 
+// Styles remain the same as your original code
 const styles = StyleSheet.create({
   image: {
     width: wp(3),
@@ -480,12 +589,10 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#fafafa",
   },
-
   loadingContainer: {
     justifyContent: "center",
     alignItems: "center",
   },
-
   loadingText: {
     marginTop: 10,
     fontSize: 16,
@@ -493,7 +600,6 @@ const styles = StyleSheet.create({
     fontWeight: "500",
     fontFamily: "Poppins",
   },
-   // Notification styles
   notificationContainer: {
     position: "absolute",
     top: hp(3), 
@@ -502,7 +608,6 @@ const styles = StyleSheet.create({
     zIndex: 9999,
     alignItems: "center",
   },
-
   notificationBox: {
     paddingVertical: hp(1),
     paddingHorizontal: wp(4),
@@ -516,7 +621,6 @@ const styles = StyleSheet.create({
     shadowRadius: 3.84,
     elevation: 8,
   },
-
   notificationText: {
     color: "#fafafa",
     fontSize: wp(2.2),
@@ -524,7 +628,6 @@ const styles = StyleSheet.create({
     textAlign: "center",
     fontWeight: "600",
   },
-  // HEADER STYLES
   header: {
     paddingHorizontal: wp(8),
     paddingVertical: hp(0.5),
@@ -534,14 +637,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "flex-start",
   },
-
-  // BODY STYLES
   body: {
     flex: 1,
     justifyContent: "center",
     alignItems: "center",
   },
-  // LAYER 1
   layer1: {
     width: wp(160),
     borderBottomWidth: 1,
@@ -556,6 +656,9 @@ const styles = StyleSheet.create({
     display: "flex",
     flexDirection: "row",
     marginTop: hp(1),
+  },
+  ProfileImageContainer: {
+    position: "relative",
   },
   ProfileImage: {
     width: wp(15),
@@ -583,12 +686,6 @@ const styles = StyleSheet.create({
     fontWeight: "300",
     letterSpacing: 0.5,
   },
-  ChangeProfileBtn: {
-    backgroundColor: "#9B72CF",
-    paddingVertical: hp(1),
-    paddingHorizontal: wp(3),
-    borderRadius: wp(2),
-  },
   BtnText: {
     fontFamily: "Poppins",
     fontSize: wp(2.2),
@@ -596,8 +693,6 @@ const styles = StyleSheet.create({
     fontWeight: "500",
     letterSpacing: 0.5,
   },
-
-  // LAYER 2
   layer2: {
     width: wp(160),
     paddingHorizontal: wp(1),
@@ -664,14 +759,11 @@ const styles = StyleSheet.create({
     borderColor: "#434343",
     backgroundColor: "#fafafa",
   },
-
-  // LAYER 3
   layer3: {
     width: wp(160),
     paddingHorizontal: wp(1),
     paddingVertical: wp(2),
   },
-
   EditBtn: {
     backgroundColor: "#9B72CF",
     paddingVertical: hp(1),
@@ -704,8 +796,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: wp(8),
     borderRadius: wp(2),
   },
-
-  // FOOTER STYLES
   footer: {
     backgroundColor: "#E5E5E5",
     height: hp(4),
@@ -735,6 +825,12 @@ const styles = StyleSheet.create({
     borderColor: "#9B72CF",
     minWidth: wp(18),
     height: hp(3),
+  },
+    ChangeProfileBtn: {
+    backgroundColor: "#9B72CF",
+    paddingVertical: hp(1),
+    paddingHorizontal: wp(3),
+    borderRadius: wp(2),
   },
   categoryInfosActive: {
     backgroundColor: "#fafafa",
